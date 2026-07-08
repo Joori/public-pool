@@ -89,7 +89,32 @@ export interface CoinbasePayoutValidationResult {
     submittedOutputs?: CoinbasePayoutOutput[];
 }
 
+export interface TemplateFeeRateStats {
+    min: number;
+    median: number;
+    max: number;
+}
+
+export interface TemplateSummary {
+    height: number;
+    previousBlockHash: string;
+    createdAt: number;
+    networkDifficulty: number;
+    coinbaseValueSats: string;
+    transactionCount: number;
+    totalFeesSats: number;
+    weight: number;
+    weightLimit: number;
+    weightPercent: number;
+    sigops: number;
+    sigopLimit: number;
+    feeRateSatPerVByte: TemplateFeeRateStats | null;
+    witnessCommitmentPresent: boolean;
+    poolTag: string;
+}
+
 const VERSION_ROLLING_MASK = 0x1fffe000;
+const POOL_COINBASE_TAG = 'Public-Pool';
 
 @Injectable()
 export class TemplateProviderService implements OnModuleInit {
@@ -149,6 +174,44 @@ export class TemplateProviderService implements OnModuleInit {
     public getLatestTemplate(): TemplateProviderTemplate | undefined {
         this.cleanup();
         return this.latestTemplateId == null ? undefined : this.templates.get(this.latestTemplateId);
+    }
+
+    public getCurrentTemplateSummary(): TemplateSummary | null {
+        const template = this.getLatestTemplate();
+        if (template == null) {
+            return null;
+        }
+
+        const totalFeesSats = template.transactions.reduce((sum, tx) => sum + tx.fee, 0);
+        const weight = template.transactions.reduce((sum, tx) => sum + tx.weight, 0);
+        const sigops = template.transactions.reduce((sum, tx) => sum + tx.sigops, 0);
+
+        const feeRates = template.transactions
+            .filter(tx => tx.weight > 0)
+            .map(tx => tx.fee / (tx.weight / 4))
+            .sort((a, b) => a - b);
+
+        return {
+            height: template.height,
+            previousBlockHash: Buffer.from(template.prevHash).reverse().toString('hex'),
+            createdAt: template.createdAt,
+            networkDifficulty: template.networkDifficulty,
+            coinbaseValueSats: template.coinbaseValue.toString(),
+            transactionCount: template.transactions.length,
+            totalFeesSats,
+            weight,
+            weightLimit: template.weightLimit,
+            weightPercent: template.weightLimit > 0 ? (weight / template.weightLimit) * 100 : 0,
+            sigops,
+            sigopLimit: template.sigopLimit,
+            feeRateSatPerVByte: feeRates.length > 0 ? {
+                min: feeRates[0],
+                median: feeRates[Math.floor(feeRates.length / 2)],
+                max: feeRates[feeRates.length - 1],
+            } : null,
+            witnessCommitmentPresent: template.jobTemplate.block.witnessCommit != null,
+            poolTag: POOL_COINBASE_TAG,
+        };
     }
 
     public validateDeclaredWtxids(input: {

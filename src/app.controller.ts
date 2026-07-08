@@ -13,6 +13,7 @@ import { UserAgentReportView } from './ORM/_views/user-agent-report/user-agent-r
 import { StratumV2Service } from './services/stratum-v2.service';
 import { ShareAccountingService } from './ORM/share-accounting/share-accounting.service';
 import { RedisMessagingService } from './services/redis-messaging.service';
+import { TemplateProviderService } from './services/template-provider.service';
 import { normalizePayoutMode } from './types/payout-mode';
 
 @Controller()
@@ -32,7 +33,8 @@ export class AppController {
     private readonly userAgentReportService: UserAgentReportService,
     private readonly stratumV2Service: StratumV2Service,
     private readonly shareAccountingService: ShareAccountingService,
-    private readonly redisMessagingService: RedisMessagingService
+    private readonly redisMessagingService: RedisMessagingService,
+    private readonly templateProviderService: TemplateProviderService
   ) { }
 
   @Get('info')
@@ -211,6 +213,11 @@ export class AppController {
   @Get('network')
   public async network() {
     return this.bitcoinRpcService.miningInfo ?? {};
+  }
+
+  @Get('template/current')
+  public async currentTemplate() {
+    return this.templateProviderService.getCurrentTemplateSummary() ?? {};
   }
 
   @Get('info/chart')
