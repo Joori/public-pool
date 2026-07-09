@@ -340,7 +340,7 @@ describe('TemplateProviderService', () => {
         } as any);
         const jobTemplate = await firstValueFrom(jobsService.newMiningJob$);
         return {
-            provider: new TemplateProviderService(jobsService, bitcoinRpcService),
+            provider: new TemplateProviderService(jobsService, undefined as any, bitcoinRpcService),
             jobTemplate,
             bitcoinRpcService,
         };

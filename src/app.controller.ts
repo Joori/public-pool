@@ -217,7 +217,7 @@ export class AppController {
 
   @Get('template/current')
   public async currentTemplate() {
-    return this.templateProviderService.getCurrentTemplateSummary() ?? {};
+    return (await this.templateProviderService.getCurrentTemplateSummary()) ?? {};
   }
 
   @Get('info/chart')

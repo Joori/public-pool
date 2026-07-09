@@ -53,13 +53,14 @@ export class BitcoinRpcService implements OnModuleInit {
         console.log(`MASTER? ${process.env.MASTER}`)
         if (process.env.MASTER != 'true') {
             await this.loadLatestMiningInfoForReplayProcess();
-            // API-only processes still load templates (from the Redis cache the master
-            // process populates, not from bitcoind) so TemplateProviderService can serve
-            // template-transparency endpoints like /api/template/current.
-            await this.loadLatestTemplateForWorker();
+            if (process.env.API_ONLY != 'true') {
+                await this.loadLatestTemplateForWorker();
+            }
             await this.redisMessagingService.subscribeMiningInfoUpdates(async (miningInfo: IMiningInfo) => {
                 this.miningInfo = miningInfo;
-                await this.loadTemplateForWorker(miningInfo.blocks);
+                if (process.env.API_ONLY != 'true') {
+                    await this.loadTemplateForWorker(miningInfo.blocks);
+                }
             });
             if (process.env.API_ONLY == 'true') {
                 console.log('API-only process using Redis mining info replay');

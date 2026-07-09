@@ -2,11 +2,12 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import * as bitcoinjs from 'bitcoinjs-lib';
 import { Subscription } from 'rxjs';
 
-import { IBlockTemplateTx } from '../models/bitcoin-rpc/IBlockTemplate';
+import { IBlockTemplate, IBlockTemplateTx } from '../models/bitcoin-rpc/IBlockTemplate';
 import { AddressObject } from '../models/MiningJob';
 import { Sv2DeclareMiningJob, Sv2PushSolution } from '../models/sv2/sv2-jdp-messages';
 import { hash256 } from '../utils/hash.utils';
 import { BitcoinRpcService } from './bitcoin-rpc.service';
+import { RedisMessagingService } from './redis-messaging.service';
 import { IJobTemplate, StratumV1JobsService } from './stratum-v1-jobs.service';
 
 export interface TemplateProviderTransaction {
@@ -120,11 +121,15 @@ const POOL_COINBASE_TAG = 'Public-Pool';
 export class TemplateProviderService implements OnModuleInit {
     private readonly templates = new Map<string, TemplateProviderTemplate>();
     private readonly retentionMs = this.readPositiveInt('SV2_TEMPLATE_RETENTION_MS', 10 * 60 * 1000);
+    private readonly summaryCacheTtlMs = this.readPositiveInt('TEMPLATE_SUMMARY_CACHE_TTL_MS', 5000);
     private subscription: Subscription | null = null;
     private latestTemplateId: string | null = null;
+    private cachedSummary: TemplateSummary | null = null;
+    private cachedSummaryAt = 0;
 
     constructor(
         private readonly jobsService: StratumV1JobsService,
+        private readonly redisMessagingService: RedisMessagingService,
         private readonly bitcoinRpcService?: BitcoinRpcService,
     ) {}
 
@@ -176,42 +181,71 @@ export class TemplateProviderService implements OnModuleInit {
         return this.latestTemplateId == null ? undefined : this.templates.get(this.latestTemplateId);
     }
 
-    public getCurrentTemplateSummary(): TemplateSummary | null {
-        const template = this.getLatestTemplate();
-        if (template == null) {
+    // Only ever called from AppController, which only runs in API-only processes.
+    // Those processes must never hold a full parsed template in memory (see
+    // SV2_TEMPLATE_RETENTION_MS / this.templates, which is for the master/worker
+    // mining path only), so this reads the master's Redis-cached raw template
+    // on demand, extracts a few hundred bytes of summary fields, and lets the
+    // rest of the template fall out of scope for GC. A short-TTL in-process
+    // cache of just the summary avoids a Redis round trip on every request.
+    public async getCurrentTemplateSummary(): Promise<TemplateSummary | null> {
+        const now = Date.now();
+        if (this.cachedSummary != null && (now - this.cachedSummaryAt) < this.summaryCacheTtlMs) {
+            return this.cachedSummary;
+        }
+
+        const rawTemplate = await this.redisMessagingService.getLatestBlockTemplate();
+        if (rawTemplate == null) {
             return null;
         }
 
-        const totalFeesSats = template.transactions.reduce((sum, tx) => sum + tx.fee, 0);
-        const weight = template.transactions.reduce((sum, tx) => sum + tx.weight, 0);
-        const sigops = template.transactions.reduce((sum, tx) => sum + tx.sigops, 0);
+        const summary = this.buildSummaryFromRawTemplate(rawTemplate);
+        this.cachedSummary = summary;
+        this.cachedSummaryAt = now;
+        return summary;
+    }
 
-        const feeRates = template.transactions
-            .filter(tx => tx.weight > 0)
-            .map(tx => tx.fee / (tx.weight / 4))
+    private buildSummaryFromRawTemplate(template: IBlockTemplate): TemplateSummary {
+        const transactions = template.transactions ?? [];
+        const totalFeesSats = transactions.reduce((sum, tx) => sum + (tx.fee ?? 0), 0);
+        const weight = transactions.reduce((sum, tx) => sum + (tx.weight ?? 0), 0);
+        const sigops = transactions.reduce((sum, tx) => sum + (tx.sigops ?? 0), 0);
+        const weightLimit = template.weightlimit ?? 4_000_000;
+
+        const feeRates = transactions
+            .filter(tx => (tx.weight ?? 0) > 0)
+            .map(tx => (tx.fee ?? 0) / (tx.weight / 4))
             .sort((a, b) => a - b);
 
         return {
             height: template.height,
-            previousBlockHash: Buffer.from(template.prevHash).reverse().toString('hex'),
-            createdAt: template.createdAt,
-            networkDifficulty: template.networkDifficulty,
-            coinbaseValueSats: template.coinbaseValue.toString(),
-            transactionCount: template.transactions.length,
+            previousBlockHash: template.previousblockhash,
+            createdAt: template.curtime * 1000,
+            networkDifficulty: this.calculateNetworkDifficulty(parseInt(template.bits, 16)),
+            coinbaseValueSats: template.coinbasevalue.toString(),
+            transactionCount: transactions.length,
             totalFeesSats,
             weight,
-            weightLimit: template.weightLimit,
-            weightPercent: template.weightLimit > 0 ? (weight / template.weightLimit) * 100 : 0,
+            weightLimit,
+            weightPercent: weightLimit > 0 ? (weight / weightLimit) * 100 : 0,
             sigops,
-            sigopLimit: template.sigopLimit,
+            sigopLimit: template.sigoplimit ?? 80_000,
             feeRateSatPerVByte: feeRates.length > 0 ? {
                 min: feeRates[0],
                 median: feeRates[Math.floor(feeRates.length / 2)],
                 max: feeRates[feeRates.length - 1],
             } : null,
-            witnessCommitmentPresent: template.jobTemplate.block.witnessCommit != null,
+            witnessCommitmentPresent: template.default_witness_commitment != null,
             poolTag: POOL_COINBASE_TAG,
         };
+    }
+
+    private calculateNetworkDifficulty(nBits: number): number {
+        const mantissa = nBits & 0x007fffff;
+        const exponent = (nBits >> 24) & 0xff;
+        const target = mantissa * Math.pow(256, exponent - 3);
+        const maxTarget = Math.pow(2, 208) * 65535;
+        return maxTarget / target;
     }
 
     public validateDeclaredWtxids(input: {
