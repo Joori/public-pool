@@ -67,6 +67,7 @@ services:
     volumes:
       - "./.env:/public-pool/.env:ro"
       - "./secrets:/public-pool/secrets:ro"
+      - "./secrets-generated:/public-pool/secrets-generated:rw"
     environment:
       NODE_ENV: production
       DB_HOST: 127.0.0.1

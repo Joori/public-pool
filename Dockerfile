@@ -28,6 +28,12 @@ RUN npm ci && npm run build && npm prune --omit=dev
 
 FROM node:24.16.0-bookworm-slim
 
+# openssl generates a self-signed TLS cert/key pair on first run when none is
+# supplied (see src/scripts/start-docker.ts / README "TLS certificates").
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl \
+    && apt clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
 # Expose ports for Stratum and Bitcoin RPC
 EXPOSE 3333 3334 8332
 

@@ -49,3 +49,4 @@ settings.json
 **.pem
 .env*
 secrets/
+secrets-generated/

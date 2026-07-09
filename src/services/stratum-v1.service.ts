@@ -261,8 +261,8 @@ export class StratumV1Service implements OnModuleInit {
     private createSecureSocketServer(payoutMode: PayoutMode): Server {
 
         const currentDirectory = process.cwd();
-        const keyPath = path.join(currentDirectory, 'secrets', 'key.pem');
-        const certPath = path.join(currentDirectory, 'secrets', 'cert.pem');
+        const keyPath = process.env.STRATUM_TLS_KEY_PATH || path.join(currentDirectory, 'secrets', 'key.pem');
+        const certPath = process.env.STRATUM_TLS_CERT_PATH || path.join(currentDirectory, 'secrets', 'cert.pem');
 
         const tlsOptions: TlsOptions = {
             key: readFileSync(keyPath),
@@ -339,7 +339,14 @@ export class StratumV1Service implements OnModuleInit {
             return;
         }
 
-        const server = listener.secure ? this.createSecureSocketServer(listener.payoutMode) : this.createSocketServer(listener.payoutMode);
+        let server: Server;
+        try {
+            server = listener.secure ? this.createSecureSocketServer(listener.payoutMode) : this.createSocketServer(listener.payoutMode);
+        } catch (error) {
+            console.error(`Failed to start ${listener.secure ? 'Stratum TLS' : 'Stratum'} ${listener.payoutMode} listener on port ${listener.port}: ${error.message}.${listener.secure ? ' TLS stratum stays disabled on this port; plaintext stratum ports are unaffected.' : ''}`);
+            return;
+        }
+
         listener.server = server;
         listener.paused = false;
 

@@ -144,6 +144,30 @@ zmqpubrawblock=tcp://0.0.0.0:3000
 
 to your bitcoin.conf.
 
+## TLS certificates
+
+This fork does not ship `.pem` files, and never will: committing a private key
+to a public repository makes the TLS on `SECURE_STRATUM_PORTS` decorative,
+anyone who clones the repo holds the same key and can decrypt or impersonate
+the server.
+
+When `STRATUM_SECURE=true` and no certificate is found, the container
+generates a self-signed RSA-2048 cert/key pair on startup (valid ~10 years)
+into `secrets-generated/`, logs that a self-signed certificate is in use, and
+uses it. That directory is a Docker volume so the generated pair persists
+across restarts instead of being regenerated (and changing fingerprint) every
+time. Self-signed certs encrypt the connection but don't verify server
+identity, so miners must accept/pin the certificate out of band.
+
+To use a real certificate instead, place it at `secrets/cert.pem` and
+`secrets/key.pem` (or point `STRATUM_TLS_CERT_PATH` / `STRATUM_TLS_KEY_PATH` at
+another location) before starting the container. Real certs there always take
+precedence over a generated one. The `secrets/` directory is mounted read-only,
+so certs placed there are never modified by the app.
+
+If TLS certs are missing or unreadable at runtime, only the TLS stratum
+listeners fail to start, plaintext stratum ports are unaffected.
+
 ## Testing
 
 Baseline unit regression capture:
