@@ -256,7 +256,7 @@ describe('Sv2TemplateDistributionConnection compliance', () => {
             miningInfo: { blocks: MockRecording1.BLOCK_TEMPLATE.height },
         } as any);
         const jobTemplate = await firstValueFrom(jobsService.newMiningJob$);
-        const templateProvider = new TemplateProviderService(jobsService);
+        const templateProvider = new TemplateProviderService(jobsService, undefined as any);
         const bitcoinRpcService = {
             SUBMIT_BLOCK: jest.fn().mockResolvedValue(null),
         };
