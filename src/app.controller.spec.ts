@@ -37,6 +37,8 @@ describe('AppController', () => {
         getJsonCache: jest.fn().mockResolvedValue(null),
         setJsonCache: jest.fn().mockResolvedValue(undefined),
       },
+      {} as any,
+      {} as any,
     );
   };
 

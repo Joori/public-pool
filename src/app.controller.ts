@@ -1,5 +1,5 @@
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { Controller, Get, Inject, Query } from '@nestjs/common';
+import { BadRequestException, Controller, Get, Inject, Query } from '@nestjs/common';
 import { Cache } from 'cache-manager';
 import { firstValueFrom } from 'rxjs';
 
@@ -11,6 +11,7 @@ import { ClientService } from './ORM/client/client.service';
 import { BitcoinRpcService } from './services/bitcoin-rpc.service';
 import { UserAgentReportView } from './ORM/_views/user-agent-report/user-agent-report.view';
 import { StratumV2Service } from './services/stratum-v2.service';
+import { NonceDistributionService } from './ORM/share-accounting/nonce-distribution.service';
 import { ShareAccountingService } from './ORM/share-accounting/share-accounting.service';
 import { RedisMessagingService } from './services/redis-messaging.service';
 import { TemplateProviderService } from './services/template-provider.service';
@@ -34,7 +35,8 @@ export class AppController {
     private readonly stratumV2Service: StratumV2Service,
     private readonly shareAccountingService: ShareAccountingService,
     private readonly redisMessagingService: RedisMessagingService,
-    private readonly templateProviderService: TemplateProviderService
+    private readonly templateProviderService: TemplateProviderService,
+    private readonly nonceDistributionService: NonceDistributionService
   ) { }
 
   @Get('info')
@@ -218,6 +220,26 @@ export class AppController {
   @Get('template/current')
   public async currentTemplate() {
     return (await this.templateProviderService.getCurrentTemplateSummary()) ?? {};
+  }
+
+  @Get('nonce-distribution')
+  public async nonceDistribution(@Query('from') from?: string, @Query('to') to?: string) {
+    const fromDate = this.parseOptionalDate('from', from);
+    const toDate = this.parseOptionalDate('to', to);
+    return this.nonceDistributionService.getDistribution(fromDate, toDate);
+  }
+
+  private parseOptionalDate(paramName: string, value?: string): Date | undefined {
+    if (value == null || value === '') {
+      return undefined;
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      throw new BadRequestException(`Invalid ${paramName}: expected an ISO 8601 timestamp`);
+    }
+
+    return date;
   }
 
   @Get('info/chart')
