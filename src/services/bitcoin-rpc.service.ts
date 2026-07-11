@@ -7,17 +7,27 @@ import { RpcBlockService } from '../ORM/rpc-block/rpc-block.service';
 import * as zmq from 'zeromq';
 
 import { IBlockTemplate } from '../models/bitcoin-rpc/IBlockTemplate';
+import { IMempoolInfo } from '../models/bitcoin-rpc/IMempoolInfo';
 import { IMiningInfo } from '../models/bitcoin-rpc/IMiningInfo';
 import { RedisMessagingService } from './redis-messaging.service';
+
+const MEMPOOL_INFO_CACHE_KEY = 'mempoolInfo';
+// Master refreshes this every ~60s (see resetTemplateInterval$); TTL covers a
+// couple of missed cycles before other processes see it go stale.
+const MEMPOOL_INFO_REDIS_TTL_MS = 120_000;
 
 @Injectable()
 export class BitcoinRpcService implements OnModuleInit {
 
-    
+
     private client: AxiosInstance;
     private _newBlockTemplate$: BehaviorSubject<IBlockTemplate> = new BehaviorSubject(undefined);
     private resetTemplateInterval$ = new Subject<void>();
     private rpcRequestId = 0;
+
+    private readonly mempoolSummaryCacheTtlMs = this.readPositiveInt('MEMPOOL_SUMMARY_CACHE_TTL_MS', 5000);
+    private cachedMempoolInfo: IMempoolInfo | null = null;
+    private cachedMempoolInfoAt = 0;
 
     public miningInfo: IMiningInfo;
     public newBlockTemplate$ = this._newBlockTemplate$.pipe(filter(block => block != null), shareReplay({ refCount: true, bufferSize: 1 }));
@@ -136,6 +146,22 @@ export class BitcoinRpcService implements OnModuleInit {
         await this.redisMessagingService.setLatestMiningInfo(this.miningInfo);
         await this.redisMessagingService.setBlockTemplate(this.miningInfo.blocks, blockTemplate);
         await this.redisMessagingService.publishMiningInfoUpdate(this.miningInfo);
+
+        await this.refreshMempoolInfo();
+    }
+
+    // Piggybacks on the same trigger as the template refresh (new block via ZMQ,
+    // plus the 60s resetTemplateInterval$ between blocks) rather than running its
+    // own polling loop. getmempoolinfo is cheap, and mempool depth changes
+    // continuously rather than only per-block, so the template's ~60s cadence
+    // (not the ~10min block cadence) is the better fit.
+    private async refreshMempoolInfo(): Promise<void> {
+        const mempoolInfo = await this.getMempoolInfo();
+        if (mempoolInfo == null) {
+            return;
+        }
+
+        await this.redisMessagingService.setJsonCache(MEMPOOL_INFO_CACHE_KEY, mempoolInfo, MEMPOOL_INFO_REDIS_TTL_MS);
     }
 
     private async loadLatestTemplateForWorker() {
@@ -220,6 +246,31 @@ export class BitcoinRpcService implements OnModuleInit {
 
     }
 
+    public async getMempoolInfo(): Promise<IMempoolInfo | null> {
+        try {
+            return await this.callRpc<IMempoolInfo>('getmempoolinfo');
+        } catch (e) {
+            console.error('Error getmempoolinfo', e.message);
+            return null;
+        }
+    }
+
+    // Read path for API workers: never calls bitcoind directly, only Redis (written
+    // by the master process above), with a short in-process cache on top so a burst
+    // of API requests doesn't hit Redis every time. Same shape as
+    // TemplateProviderService.getCurrentTemplateSummary().
+    public async getMempoolSummary(): Promise<IMempoolInfo | null> {
+        const now = Date.now();
+        if (this.cachedMempoolInfo != null && (now - this.cachedMempoolInfoAt) < this.mempoolSummaryCacheTtlMs) {
+            return this.cachedMempoolInfo;
+        }
+
+        const mempoolInfo = await this.redisMessagingService.getJsonCache<IMempoolInfo>(MEMPOOL_INFO_CACHE_KEY);
+        this.cachedMempoolInfo = mempoolInfo;
+        this.cachedMempoolInfoAt = now;
+        return mempoolInfo;
+    }
+
     public async SUBMIT_BLOCK(hexdata: string): Promise<string> {
         let response: string = 'unknown';
         try {
@@ -280,5 +331,10 @@ export class BitcoinRpcService implements OnModuleInit {
             rpcUrl.port = port.toString();
         }
         return rpcUrl.toString();
+    }
+
+    private readPositiveInt(name: string, defaultValue: number): number {
+        const value = Number(process.env[name]);
+        return Number.isInteger(value) && value > 0 ? value : defaultValue;
     }
 }

@@ -214,7 +214,16 @@ export class AppController {
 
   @Get('network')
   public async network() {
-    return this.bitcoinRpcService.miningInfo ?? {};
+    const networkInfo = this.bitcoinRpcService.miningInfo ?? {};
+    const mempoolInfo = await this.bitcoinRpcService.getMempoolSummary();
+
+    return {
+      ...networkInfo,
+      ...(mempoolInfo != null ? {
+        mempoolTransactionCount: mempoolInfo.size,
+        mempoolVsizeBytes: mempoolInfo.bytes,
+      } : {}),
+    };
   }
 
   @Get('template/current')
