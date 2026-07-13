@@ -41,6 +41,19 @@ services:
     container_name: public-pool-redis
     restart: unless-stopped
     logging: *log-limits
+    # allkeys-lru (not volatile-lru): Redis is a hot-path cache/message-bus here,
+    # not a source of truth, and some pointer keys (mining-info:latest,
+    # block-template:<mode>:latest, sv1-bridge:latest*) are intentionally written
+    # without a TTL since they're meant to always hold the current value. Under
+    # volatile-lru those keys (and any orphaned no-TTL key) would be permanently
+    # unevictable, so a leak like the one that filled swap would just block writes
+    # once maxmemory is hit instead of reclaiming space.
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379/tcp"
     volumes:
