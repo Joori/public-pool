@@ -18,7 +18,9 @@ import { createDatabaseOptions } from './database.config';
 import { BitcoinAddressValidator } from './models/validators/bitcoin-address.validator';
 import { BitcoinRpcService } from './services/bitcoin-rpc.service';
 import { RedisMessagingModule } from './services/redis-messaging.module';
+import { StratumV1JobsService } from './services/stratum-v1-jobs.service';
 import { Sv2AuthorityService } from './services/sv2-authority.service';
+import { TemplateProviderService } from './services/template-provider.service';
 
 @Module({
     imports: [
@@ -57,6 +59,8 @@ import { Sv2AuthorityService } from './services/sv2-authority.service';
         BitcoinRpcService,
         BitcoinAddressValidator,
         Sv2AuthorityService,
+        StratumV1JobsService,
+        TemplateProviderService,
     ],
 })
 export class ApiModule {}
