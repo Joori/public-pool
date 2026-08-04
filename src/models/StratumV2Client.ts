@@ -78,7 +78,7 @@ const DEFAULT_DIFFICULTY_CHECK_INTERVAL_MS = 60 * 1000;
 const DEFAULT_CLIENT_HASHRATE_PERSIST_INTERVAL_MS = 60 * 1000;
 const FIXED_STANDARD_EXTRANONCE2 = '0000000000000000';
 const DEFAULT_SV2_JOB_RETENTION_MS = 5 * 60 * 1000;
-const DEFAULT_SV2_MAX_RETAINED_JOBS_PER_CHANNEL = 16;
+const DEFAULT_SV2_MAX_RETAINED_JOBS_PER_CHANNEL = 64;
 const DEFAULT_SV2_MAX_QUEUED_JOB_OPERATIONS = 4;
 const DEFAULT_SV2_MAX_SOCKET_BUFFER_BYTES = 256 * 1024;
 const DEFAULT_SV2_SOCKET_WRITE_TIMEOUT_MS = 2 * 1000;
@@ -2088,11 +2088,11 @@ export class StratumV2Client {
     ): boolean {
         const submitted = submittedVersion >>> 0;
         const base = headerContext.baseVersion >>> 0;
-        if (this.versionRollingEnabled) {
-            if (((submitted ^ base) & BIP320_CONSENSUS_VERSION_MASK) !== 0) {
-                return false;
-            }
-        } else if (submitted !== base) {
+        // Some SV2 clients roll BIP320 general-purpose version bits even when
+        // they did not explicitly require version rolling during setup. Those
+        // bits are non-consensus signalling space; reject only changes outside
+        // that mask and continue enforcing required bits below.
+        if (((submitted ^ base) & BIP320_CONSENSUS_VERSION_MASK) !== 0) {
             return false;
         }
         if ((submitted & headerContext.requiredVersionBits) !== headerContext.requiredVersionBits) {

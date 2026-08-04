@@ -12,6 +12,7 @@ describe('StratumV1Service', () => {
     const originalTlsHandshakeTimeoutMs = process.env.STRATUM_TLS_HANDSHAKE_TIMEOUT_MS;
     const originalSocketTimeoutMs = process.env.STRATUM_SOCKET_TIMEOUT_MS;
     const originalTcpKeepAliveInitialDelayMs = process.env.STRATUM_TCP_KEEPALIVE_INITIAL_DELAY_MS;
+    const originalFanoutTargetClientsPerWorker = process.env.STRATUM_FANOUT_TARGET_CLIENTS_PER_WORKER;
 
     let service: StratumV1Service;
     let clientService;
@@ -19,6 +20,8 @@ describe('StratumV1Service', () => {
     let stratumV2Service;
     let redisMessagingService;
     let miningJobs: Subject<any>;
+    let prestageJobs: Subject<any>;
+    let prestageActivations: Subject<any>;
     let consoleLogSpy: jest.SpyInstance;
     let consoleWarnSpy: jest.SpyInstance;
 
@@ -36,13 +39,18 @@ describe('StratumV1Service', () => {
         };
         redisMessagingService = {};
         miningJobs = new Subject();
+        prestageJobs = new Subject();
+        prestageActivations = new Subject();
         service = new StratumV1Service(
-            {} as any,
+            { newSv1PrestageActivation$: prestageActivations.asObservable() } as any,
             clientService,
             {} as any,
             {} as any,
             {} as any,
-            { newMiningJob$: miningJobs.asObservable() } as any,
+            {
+                newMiningJob$: miningJobs.asObservable(),
+                sv1PrestageJob$: prestageJobs.asObservable(),
+            } as any,
             {} as any,
             stratumV2Service as any,
             userAgentReportService as any,
@@ -63,6 +71,7 @@ describe('StratumV1Service', () => {
         restoreEnv('STRATUM_TLS_HANDSHAKE_TIMEOUT_MS', originalTlsHandshakeTimeoutMs);
         restoreEnv('STRATUM_SOCKET_TIMEOUT_MS', originalSocketTimeoutMs);
         restoreEnv('STRATUM_TCP_KEEPALIVE_INITIAL_DELAY_MS', originalTcpKeepAliveInitialDelayMs);
+        restoreEnv('STRATUM_FANOUT_TARGET_CLIENTS_PER_WORKER', originalFanoutTargetClientsPerWorker);
         consoleLogSpy.mockRestore();
         consoleWarnSpy.mockRestore();
         jest.useRealTimers();
@@ -137,6 +146,7 @@ describe('StratumV1Service', () => {
     });
 
     it('enqueues a 100,000-client fanout without per-client async serialization', () => {
+        process.env.STRATUM_FANOUT_TARGET_CLIENTS_PER_WORKER = '10000';
         const clientCount = 100_000;
         let writes = 0;
         const broadcastMiningJob = () => {
@@ -166,6 +176,8 @@ describe('StratumV1Service', () => {
             event: 'stratum_job_fanout',
             eventId: 'load-test',
             clients: clientCount,
+            targetClientsPerWorker: 10_000,
+            overTargetClients: 90_000,
             written: clientCount,
         }));
         expect(trace.milestoneMs).toEqual(expect.objectContaining({
@@ -174,6 +186,78 @@ describe('StratumV1Service', () => {
             p99: expect.any(Number),
         }));
         expect(trace.totalMs).toBeLessThan(1_000);
+    });
+
+    it('pre-stages next-height jobs for connected miners without broadcasting them', async () => {
+        process.env.MASTER = 'false';
+        process.env.STRATUM_PORTS = '';
+        process.env.STRATUM_SECURE = 'false';
+        const clients = Array.from({ length: 3 }, () => ({
+            preStageMiningJob: jest.fn().mockReturnValue(true),
+            broadcastMiningJob: jest.fn(),
+        }));
+        clients.forEach(client => (service as any).clients.add(client));
+        await service.onModuleInit();
+        const prestage = {
+            blockData: {
+                id: 'prestage-2',
+                height: 900002,
+                payoutMode: 'solo',
+                notificationEventId: 'prestage-event',
+            },
+        };
+
+        prestageJobs.next(prestage);
+        await Promise.resolve();
+
+        clients.forEach(client => {
+            expect(client.preStageMiningJob).toHaveBeenCalledWith(prestage);
+            expect(client.broadcastMiningJob).not.toHaveBeenCalled();
+        });
+        expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('sv1_job_prestage'));
+        service.onModuleDestroy();
+    });
+
+    it('promotes and broadcasts compact prestage activations immediately', async () => {
+        process.env.MASTER = 'false';
+        process.env.STRATUM_PORTS = '';
+        process.env.STRATUM_SECURE = 'false';
+        const activatedJob = {
+            blockData: {
+                id: 'activated-2',
+                height: 900002,
+                tipKey: `900002:${'55'.repeat(32)}`,
+                payoutMode: 'solo',
+                jobType: 'empty',
+                isNewBlock: true,
+                clearJobs: true,
+                notificationEventId: 'activate-2',
+            },
+        };
+        const activateLatestPrestage = jest.fn().mockReturnValue(activatedJob);
+        (service as any).stratumV1JobsService.activateLatestPrestage = activateLatestPrestage;
+        const client = {
+            broadcastMiningJob: jest.fn().mockReturnValue({
+                status: 'written',
+                bytes: 256,
+                bufferedBytes: 0,
+                preStaged: true,
+            }),
+        };
+        (service as any).clients.add(client);
+        await service.onModuleInit();
+        const activation = {
+            eventId: 'activate-2',
+            height: 900002,
+            payoutMode: 'solo',
+            previousBlockHash: '55'.repeat(32),
+        };
+
+        prestageActivations.next(activation);
+
+        expect(activateLatestPrestage).toHaveBeenCalledWith(activation);
+        expect(client.broadcastMiningJob).toHaveBeenCalledWith(activatedJob);
+        service.onModuleDestroy();
     });
 
     it('does not log routine non-new-block fanout unless explicitly enabled', () => {

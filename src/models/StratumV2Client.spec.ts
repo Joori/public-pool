@@ -927,6 +927,41 @@ describe('StratumV2Client extended channels', () => {
         )).toBe(true);
     });
 
+    it('keeps enough retained SV2 jobs for repeated fast activation and full-template followup cycles', async () => {
+        const { client, jobTemplate } = await createClient();
+        await (client as any).handleOpenExtendedMiningChannel(serializeOpenExtendedMiningChannel({
+            requestId: 1,
+            userIdentity: 'tb1qumezefzdeqqwn5zfvgdrhxjzc5ylr39uhuxcz4.worker',
+            nominalHashRate: 0,
+            maxTarget: Buffer.alloc(32, 0xff),
+            minExtranonceSize: 8,
+        }));
+
+        let currentTemplate = jobTemplate;
+        for (let index = 0; index < 20; index++) {
+            const activation = {
+                ...createActivationTemplate(currentTemplate),
+                previousblockhash: (index + 1).toString(16).padStart(64, '0'),
+                mintime: parseInt(MockRecording1.TIME, 16) + index + 1,
+                curtime: parseInt(MockRecording1.TIME, 16) + index + 1,
+            };
+            await client.enqueueWorkActivation(activation as any);
+            currentTemplate = {
+                ...createCanonicalFollowup(currentTemplate, activation),
+                blockData: {
+                    ...createCanonicalFollowup(currentTemplate, activation).blockData,
+                    id: `canonical-followup-${index}`,
+                },
+            };
+            await client.enqueueCanonicalJob(currentTemplate);
+        }
+
+        expect((client as any).socket.destroyed).toBe(false);
+        const channel = (client as any).channels.get(1);
+        expect(channel.extendedJobs.size).toBeLessThanOrEqual((client as any).maxRetainedJobsPerChannel);
+        expect(channel.stagedFutureJobId).toBeDefined();
+    });
+
     it('activates a staged standard future and rejects incompatible activation versions', async () => {
         const { client, sentFrames, jobTemplate } = await createClient();
         await (client as any).handleOpenStandardMiningChannel(serializeOpenStandardMiningChannel({
@@ -956,7 +991,7 @@ describe('StratumV2Client extended channels', () => {
             .toBe(parseInt(activation.bits, 16));
     });
 
-    it('validates fixed/rolling versions, required bits, and the advertised minimum nTime', async () => {
+    it('validates BIP320 version rolling, required bits, and the advertised minimum nTime', async () => {
         const { client } = await createClient();
         const now = process.hrtime.bigint();
         const context = {
@@ -972,11 +1007,12 @@ describe('StratumV2Client extended channels', () => {
         };
 
         expect((client as any).isSubmissionHeaderValid(context, 0x20000004, 100)).toBe(true);
-        expect((client as any).isSubmissionHeaderValid(context, 0x20002004, 100)).toBe(false);
+        expect((client as any).isSubmissionHeaderValid(context, 0x20002004, 100)).toBe(true);
         expect((client as any).isSubmissionHeaderValid(context, 0x20000004, 99)).toBe(false);
         expect((client as any).isSubmissionHeaderValid(context, 0x20000004, 101)).toBe(true);
         expect((client as any).isSubmissionHeaderValid(context, 0x20000004, 0xffffffff)).toBe(true);
         expect((client as any).isSubmissionHeaderValid(context, 0x20000004, 0x1_0000_0000)).toBe(false);
+        expect((client as any).isSubmissionHeaderValid(context, 0x00000004, 100)).toBe(false);
 
         (client as any).versionRollingEnabled = true;
         expect((client as any).isSubmissionHeaderValid(context, 0x20002004, 100)).toBe(true);

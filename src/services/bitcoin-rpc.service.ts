@@ -10,7 +10,13 @@ import * as zmq from 'zeromq';
 import { IBlockTemplate } from '../models/bitcoin-rpc/IBlockTemplate';
 import { IMempoolInfo } from '../models/bitcoin-rpc/IMempoolInfo';
 import { IMiningInfo } from '../models/bitcoin-rpc/IMiningInfo';
-import { BlockTemplateUpdate, RedisMessagingService, Sv1BridgeUpdate } from './redis-messaging.service';
+import {
+    BlockTemplateUpdate,
+    RedisMessagingService,
+    Sv1BridgeUpdate,
+    Sv1PrestageActivation,
+    Sv1PrestageUpdate,
+} from './redis-messaging.service';
 import {
     BitcoinNetworkName,
     calculateBlockSubsidySats,
@@ -25,7 +31,23 @@ interface BlockNotificationTrace {
     startedWallMs: number;
     startedMonotonic: bigint;
     sourceNotificationReceivedAtMs?: number;
+    templateSource?: string;
     stages: Record<string, number>;
+}
+
+interface TemplateRpcSource {
+    name: string;
+    client: AxiosInstance;
+    latestLongpollId: string | null;
+    longpollLoopStarted: boolean;
+}
+
+type BridgePublishResult = 'published' | 'skipped' | 'failed';
+type UrgentBridgePublishResult = 'acknowledged' | 'fallback-started' | 'failed';
+
+interface BridgePublishReservation {
+    tipKey: string;
+    attemptId: number;
 }
 
 interface StoredBlockTemplateEnvelope {
@@ -66,6 +88,7 @@ interface PendingPplnsTemplatePublication {
 }
 
 const DEFAULT_PPLNS_BRIDGE_SEED_MAX_AGE_MS = 5 * 60 * 1000;
+const DEFAULT_SV1_BRIDGE_PUBLISH_BUDGET_MS = 10;
 const PPLNS_LISTENER_CONFIG_KEYS = [
     'PPLNS_STRATUM_PORTS',
     'PPLNS_SECURE_STRATUM_PORTS',
@@ -85,8 +108,11 @@ export class BitcoinRpcService implements OnModuleInit {
 
 
     private client: AxiosInstance;
+    private readonly auxiliaryTemplateSources: TemplateRpcSource[] = [];
     private _newBlockTemplate$: BehaviorSubject<IBlockTemplate> = new BehaviorSubject(undefined);
     private _newSv1BridgeTemplate$ = new ReplaySubject<IBlockTemplate>(1);
+    private _newSv1PrestageActivation$ = new ReplaySubject<Sv1PrestageActivation>(2);
+    private _newSv1PrestageTemplate$ = new ReplaySubject<IBlockTemplate>(2);
     private resetTemplateInterval$ = new Subject<void>();
     private rpcRequestId = 0;
     private readonly processedTemplateEvents = new Set<string>();
@@ -100,7 +126,11 @@ export class BitcoinRpcService implements OnModuleInit {
     private pplnsTemplatePublicationPromise: Promise<void> | null = null;
     private readonly latestBridgeTemplates = new Map<'solo' | 'pplns', IBlockTemplate>();
     private readonly canonicalEmissionStates = new Map<'solo' | 'pplns' | 'all', CanonicalEmissionState>();
-    private readonly lastPublishedBridgeTipKeys = new Map<'solo' | 'pplns', string>();
+    private readonly lastPublishedBridgeTipKeys = new Map<'solo' | 'pplns', BridgePublishReservation>();
+    private readonly lastPublishedActivationTipKeys = new Map<'solo' | 'pplns', BridgePublishReservation>();
+    private bridgePublishAttemptId = 0;
+    private readonly subsidyValidatedTemplates = new WeakSet<IBlockTemplate>();
+    private readonly lastPublishedPrestageKeys = new Map<'solo' | 'pplns', string>();
     private readonly pplnsSubsidyBridgeSeeds = new Map<number, PplnsSubsidyBridgeSeed>();
     private pplnsSeedPrecomputeTail: Promise<void> = Promise.resolve();
     private pplnsSeedPrecomputeGeneration = 0;
@@ -109,6 +139,8 @@ export class BitcoinRpcService implements OnModuleInit {
     private lastPublishedTemplateSignature: string | null = null;
     private lastPublishedTipKey: string | null = null;
     private lastPublishedCandidateHeight = -1;
+    /** Atomically reserves the fastest forward height before any Redis await. */
+    private highestUrgentCandidateHeight = -1;
     private highestPublishedCandidateHeight = -1;
     private reorgVerificationFenceHeight = -1;
     private latestLongpollId: string | null = null;
@@ -122,6 +154,10 @@ export class BitcoinRpcService implements OnModuleInit {
     public miningInfo: IMiningInfo;
     public newBlockTemplate$ = this._newBlockTemplate$.pipe(filter(block => block != null), shareReplay({ refCount: true, bufferSize: 1 }));
     public newSv1BridgeTemplate$ = this._newSv1BridgeTemplate$.pipe(shareReplay({ refCount: true, bufferSize: 1 }));
+    public newSv1PrestageActivation$ = this._newSv1PrestageActivation$.pipe(
+        shareReplay({ refCount: true, bufferSize: 2 }),
+    );
+    public newSv1PrestageTemplate$ = this._newSv1PrestageTemplate$.pipe(shareReplay({ refCount: true, bufferSize: 2 }));
     /** Core-authoritative early header activation; currently carries the solo subsidy bridge body. */
     public workActivationTemplate$ = this.newSv1BridgeTemplate$;
 
@@ -152,17 +188,30 @@ export class BitcoinRpcService implements OnModuleInit {
                 password: pass
             }
         });
+        this.configureAuxiliaryTemplateSources({ user, pass, port, timeout });
 
         console.log(`MASTER? ${process.env.MASTER}`)
         if (process.env.MASTER != 'true') {
             await this.loadLatestMiningInfoForReplayProcess();
             if (process.env.API_ONLY != 'true') {
+                if (typeof this.redisMessagingService.subscribeSv1PrestageActivations === 'function') {
+                    await this.redisMessagingService.subscribeSv1PrestageActivations(async activation => {
+                        this.handleSv1PrestageActivation(activation);
+                    });
+                }
                 await this.redisMessagingService.subscribeSv1BridgeUpdates(async update => {
-                    this.workerTemplateTail = this.workerTemplateTail
-                        .then(() => this.handleSv1BridgeUpdate(update))
-                        .catch(error => console.error(`Unable to load SV1 bridge update: ${error.message}`));
-                    await this.workerTemplateTail;
+                    // A new-tip bridge is an interrupt, not canonical replay work.
+                    // It has its own Redis socket and must never sit behind a full
+                    // template GET/JSON parse on workerTemplateTail.
+                    await this.handleSv1BridgeUpdate(update).catch(error => {
+                        console.error(`Unable to load SV1 bridge update: ${error.message}`);
+                    });
                 });
+                if (typeof this.redisMessagingService.subscribeSv1PrestageUpdates === 'function') {
+                    await this.redisMessagingService.subscribeSv1PrestageUpdates(async update => {
+                        this.handleSv1PrestageUpdate(update);
+                    });
+                }
                 await this.redisMessagingService.subscribeBlockTemplateUpdates(async update => {
                     this.workerTemplateTail = this.workerTemplateTail
                         .then(() => this.loadTemplateUpdateForWorker(update))
@@ -189,6 +238,11 @@ export class BitcoinRpcService implements OnModuleInit {
                     // state. Replaying one before canonical work can briefly put a
                     // restarting worker on an orphan; load only authoritative jobs.
                     await this.loadLatestTemplateForWorker();
+                    if (typeof this.redisMessagingService.getLatestSv1PrestageUpdates === 'function') {
+                        for (const update of await this.redisMessagingService.getLatestSv1PrestageUpdates()) {
+                            this.handleSv1PrestageUpdate(update);
+                        }
+                    }
                 });
                 await this.workerTemplateTail;
             }
@@ -204,6 +258,7 @@ export class BitcoinRpcService implements OnModuleInit {
             });
 
             this.miningInfo = await this.getMiningInfo();
+            this.validateConfiguredNetworkAgainstCore(this.miningInfo.chain);
             console.log('Using ZMQ');
             const sock = new zmq.Subscriber;
 
@@ -215,13 +270,26 @@ export class BitcoinRpcService implements OnModuleInit {
                 console.error('ZMQ Unable to connect, Retrying');
             });
 
+            const zmqTopics = (this.configService.get<string>('BITCOIN_ZMQ_TOPIC')
+                ?? process.env.BITCOIN_ZMQ_TOPIC
+                ?? 'hashblock')
+                .split(',')
+                .map(topic => topic.trim())
+                .filter(topic => topic.length > 0);
+            if (zmqTopics.length === 0) {
+                zmqTopics.push('hashblock');
+            }
             sock.connect(this.configService.get('BITCOIN_ZMQ_HOST'));
-            sock.subscribe('rawblock');
+            zmqTopics.forEach(topic => sock.subscribe(topic));
+            console.log(`ZMQ subscribed to ${zmqTopics.join(',')}`);
             // Don't await this, otherwise it will block the rest of the program
             this.listenForNewBlocks(sock);
 
             await this.getAndBroadcastLatestTemplate('startup');
             void this.listenForLongpollTemplates();
+            this.auxiliaryTemplateSources.forEach(source => {
+                void this.listenForLongpollTemplates(source);
+            });
 
             // Between new blocks we want refresh jobs with the latest transactions
             this.resetTemplateInterval$.pipe(
@@ -297,21 +365,53 @@ export class BitcoinRpcService implements OnModuleInit {
         reason: TemplateRefreshReason,
         longpollId?: string,
         sourceNotificationReceivedAtMs?: number,
+        templateSource?: TemplateRpcSource,
     ): Promise<void> {
         if (this.miningInfo?.blocks == null) {
             console.warn('Skipping block template broadcast because mining info is not available');
             return;
         }
 
-        const trace = this.startTrace(reason, sourceNotificationReceivedAtMs);
-        const blockTemplate = await this.fetchBlockTemplate(trace, longpollId);
+        const trace = this.startTrace(
+            reason,
+            sourceNotificationReceivedAtMs,
+            templateSource?.name ?? 'primary',
+        );
+        const blockTemplate = await this.fetchBlockTemplate(trace, longpollId, templateSource);
         if (blockTemplate == null) {
             console.warn(`Skipping block template broadcast for height ${this.miningInfo.blocks}; block template is not available`);
             return;
         }
+        if (templateSource != null
+            && !await this.isAuxiliaryTemplateAuthorizedByPrimary(blockTemplate, templateSource)) {
+            return;
+        }
+
+        const tipKey = `${blockTemplate.height}:${blockTemplate.previousblockhash}`;
+        const canInterruptPublicationTail = tipKey !== this.lastPublishedTipKey
+            && blockTemplate.height > Math.max(
+                this.lastPublishedCandidateHeight,
+                this.highestUrgentCandidateHeight,
+            );
+        let urgentBridgeHandled = false;
+        if (canInterruptPublicationTail) {
+            // Reserve synchronously. Two racing Core sources at the same height
+            // must not announce conflicting prevhashes before canonical reorg
+            // verification has selected one of them.
+            this.highestUrgentCandidateHeight = blockTemplate.height;
+            this.markTrace(trace, 'template_ready');
+            this.logSourceNotification(trace, blockTemplate);
+            urgentBridgeHandled = await this.publishUrgentSubsidyBridges(blockTemplate, trace)
+                !== 'failed';
+        }
 
         const publication = this.templatePublicationTail.then(() =>
-            this.publishFetchedBlockTemplate(blockTemplate, reason, trace),
+            this.publishFetchedBlockTemplate(
+                blockTemplate,
+                reason,
+                trace,
+                urgentBridgeHandled,
+            ),
         );
         this.templatePublicationTail = publication.catch(error => {
             console.error(`Unable to publish fetched block template: ${error.message}`);
@@ -349,6 +449,7 @@ export class BitcoinRpcService implements OnModuleInit {
         blockTemplate: IBlockTemplate,
         reason: TemplateRefreshReason,
         trace: BlockNotificationTrace,
+        urgentBridgeHandled = false,
     ): Promise<void> {
         const tipHeight = blockTemplate.height - 1;
         const tipKey = `${blockTemplate.height}:${blockTemplate.previousblockhash}`;
@@ -378,18 +479,20 @@ export class BitcoinRpcService implements OnModuleInit {
         }
         const isNewTip = tipKey !== this.lastPublishedTipKey;
         this.miningInfo = { ...this.miningInfo, blocks: tipHeight };
-        this.markTrace(trace, 'template_ready');
-        if (isNewTip) {
+        if (!urgentBridgeHandled) {
+            this.markTrace(trace, 'template_ready');
+        }
+        if (isNewTip && !urgentBridgeHandled) {
             this.logSourceNotification(trace, blockTemplate);
         }
 
-        if (isNewTip) {
-            // Start bridge publication first, but never await it on the
-            // authoritative path. With a healthy Redis connection its command
-            // is enqueued first; if Redis stalls, canonical storage/publication
-            // can still make progress independently.
-            void this.publishSoloSubsidyBridge(blockTemplate, trace);
-            void this.publishPplnsSubsidyBridge(blockTemplate, trace);
+        if (isNewTip && !urgentBridgeHandled) {
+            // Yield until the urgent Redis socket acknowledges the compact jobs,
+            // but enforce a tiny budget so degraded Redis cannot hold canonical
+            // storage indefinitely. This guarantees that full-body hashing and
+            // JSON serialization do not occupy the same event-loop tick before
+            // the bridge command has had an opportunity to leave the process.
+            await this.publishUrgentSubsidyBridges(blockTemplate, trace);
         }
 
         const templateSignature = this.createTemplateSignature(blockTemplate);
@@ -444,6 +547,9 @@ export class BitcoinRpcService implements OnModuleInit {
         }
         this.queueTemplatePersistence(tipHeight, [soloTemplate], trace);
         this.queuePplnsSubsidyBridgeSeedPrecompute(blockTemplate);
+        void this.publishNextHeightPrestage(blockTemplate, 'solo').catch(error => {
+            console.error(`Unable to publish next-height solo prestage: ${error.message}`);
+        });
         this.queuePplnsTemplatePublication({
             blockTemplate,
             soloTemplate,
@@ -647,7 +753,11 @@ export class BitcoinRpcService implements OnModuleInit {
         return [];
     }
 
-    private async fetchBlockTemplate(trace: BlockNotificationTrace, longpollId?: string) {
+    private async fetchBlockTemplate(
+        trace: BlockNotificationTrace,
+        longpollId?: string,
+        templateSource?: TemplateRpcSource,
+    ) {
 
         console.log(`Master fetching block template after tip ${this.miningInfo?.blocks}`);
 
@@ -656,7 +766,9 @@ export class BitcoinRpcService implements OnModuleInit {
         const maxRetryDelayMs = this.getPositiveIntegerEnv('BLOCK_TEMPLATE_RETRY_MAX_MS', 1000);
         while (blockTemplate == null) {
             try {
-                blockTemplate = await this.callRpc<IBlockTemplate>('getblocktemplate', [
+                blockTemplate = await this.callRpcWithClient<IBlockTemplate>(
+                    templateSource?.client ?? this.client,
+                    'getblocktemplate', [
                     {
                         rules: ['segwit'],
                         mode: 'template',
@@ -682,27 +794,66 @@ export class BitcoinRpcService implements OnModuleInit {
         } else {
             this.markTrace(trace, 'getblocktemplate_complete');
         }
-        this.latestLongpollId = blockTemplate.longpollid;
+        if (templateSource == null) {
+            this.latestLongpollId = blockTemplate.longpollid;
+        } else {
+            templateSource.latestLongpollId = blockTemplate.longpollid;
+        }
 
         return blockTemplate;
     }
 
-    private async listenForLongpollTemplates(): Promise<void> {
-        if (this.longpollLoopStarted || process.env.MASTER !== 'true') {
+    private async listenForLongpollTemplates(templateSource?: TemplateRpcSource): Promise<void> {
+        if (process.env.MASTER !== 'true') {
             return;
         }
-        this.longpollLoopStarted = true;
+        if (templateSource == null) {
+            if (this.longpollLoopStarted) {
+                return;
+            }
+            this.longpollLoopStarted = true;
+        } else {
+            if (templateSource.longpollLoopStarted) {
+                return;
+            }
+            templateSource.longpollLoopStarted = true;
+        }
 
         while (process.env.MASTER === 'true') {
-            const longpollId = this.latestLongpollId;
+            const longpollId = templateSource == null
+                ? this.latestLongpollId
+                : templateSource.latestLongpollId;
             if (longpollId == null) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                try {
+                    await this.getAndBroadcastLatestTemplateOnce(
+                        'startup',
+                        undefined,
+                        undefined,
+                        templateSource,
+                    );
+                } catch (error) {
+                    console.error(
+                        `Block template source ${templateSource?.name ?? 'primary'} startup failed: ${error.message}`,
+                    );
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
                 continue;
             }
             try {
-                await this.getAndBroadcastLatestTemplate('longpoll', longpollId);
+                if (templateSource == null) {
+                    await this.getAndBroadcastLatestTemplate('longpoll', longpollId);
+                } else {
+                    await this.getAndBroadcastLatestTemplateOnce(
+                        'longpoll',
+                        longpollId,
+                        undefined,
+                        templateSource,
+                    );
+                }
             } catch (error) {
-                console.error(`Block template longpoll failed: ${error.message}`);
+                console.error(
+                    `Block template longpoll failed for ${templateSource?.name ?? 'primary'}: ${error.message}`,
+                );
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
         }
@@ -853,36 +1004,250 @@ export class BitcoinRpcService implements OnModuleInit {
         });
     }
 
-    private async publishSoloSubsidyBridge(
+    private async publishUrgentSubsidyBridges(
         authoritativeTemplate: IBlockTemplate,
         trace: BlockNotificationTrace,
-    ): Promise<boolean> {
-        if (!this.isSv1SubsidyBridgeEnabled()
-            || !this.getSv1SubsidyBridgePayoutModes().has('solo')) {
-            return false;
+    ): Promise<UrgentBridgePublishResult> {
+        const startedAt = Date.now();
+        this.markTrace(trace, 'sv1_bridge_publish_started');
+        const publication = Promise.all([
+            // The compact activation is enqueued before any compatibility bridge.
+            this.publishSoloUrgentWork(authoritativeTemplate, trace, 'urgent'),
+            this.publishPplnsUrgentWork(authoritativeTemplate, trace, 'urgent'),
+        ]);
+        const budgetMs = this.getPositiveIntegerEnv(
+            'SV1_BRIDGE_PUBLISH_BUDGET_MS',
+            DEFAULT_SV1_BRIDGE_PUBLISH_BUDGET_MS,
+        );
+        let timeout: NodeJS.Timeout | null = null;
+        const result = await Promise.race([
+            publication.then(results => ({ timedOut: false as const, results })),
+            new Promise<{ timedOut: true; results?: never }>(resolve => {
+                timeout = setTimeout(() => resolve({ timedOut: true }), budgetMs);
+            }),
+        ]);
+        if (timeout != null) {
+            clearTimeout(timeout);
+        }
+
+        if (result.timedOut) {
+            this.markTrace(trace, 'sv1_bridge_publish_budget_exhausted');
+            console.warn(JSON.stringify({
+                event: 'sv1_bridge_publish_budget_exhausted',
+                eventId: trace.eventId,
+                budgetMs,
+                elapsedMs: Date.now() - startedAt,
+                templateHeight: authoritativeTemplate.height,
+                previousBlockHash: authoritativeTemplate.previousblockhash,
+            }));
+            // The urgent socket may be stuck rather than merely slow. Release
+            // only this attempt's reservations and immediately retry through the
+            // independent normal command socket. Duplicate delivery is safe: the
+            // envelope event id is identical and workers de-duplicate it.
+            this.releaseBridgeReservations(authoritativeTemplate);
+            void this.publishFallbackSubsidyBridges(authoritativeTemplate, trace, publication);
+            return 'fallback-started';
+        }
+        if (result.results.includes('failed')) {
+            this.markTrace(trace, 'sv1_bridge_publish_failed');
+            return 'failed';
+        }
+        this.markTrace(trace, 'sv1_bridge_publish_acknowledged');
+        return 'acknowledged';
+    }
+
+    private async publishFallbackSubsidyBridges(
+        authoritativeTemplate: IBlockTemplate,
+        trace: BlockNotificationTrace,
+        originalPublication: Promise<BridgePublishResult[]>,
+    ): Promise<void> {
+        // Observe the original attempt even if it rejects unexpectedly.
+        void originalPublication.catch(error => {
+            console.error(`Urgent SV1 bridge publication failed after timeout: ${error.message}`);
+        });
+        const results = await Promise.all([
+            this.publishSoloUrgentWork(authoritativeTemplate, trace, 'fallback'),
+            this.publishPplnsUrgentWork(authoritativeTemplate, trace, 'fallback'),
+        ]);
+        if (results.includes('failed')) {
+            this.markTrace(trace, 'sv1_bridge_fallback_failed');
+            console.error(JSON.stringify({
+                event: 'sv1_bridge_fallback_failed',
+                eventId: trace.eventId,
+                templateHeight: authoritativeTemplate.height,
+                previousBlockHash: authoritativeTemplate.previousblockhash,
+                results,
+            }));
+            return;
+        }
+        this.markTrace(trace, 'sv1_bridge_fallback_acknowledged');
+    }
+
+    private releaseBridgeReservations(authoritativeTemplate: IBlockTemplate): void {
+        const tipKey = `${authoritativeTemplate.height}:${authoritativeTemplate.previousblockhash}`;
+        for (const payoutMode of ['solo', 'pplns'] as const) {
+            if (this.lastPublishedBridgeTipKeys.get(payoutMode)?.tipKey === tipKey) {
+                this.lastPublishedBridgeTipKeys.delete(payoutMode);
+            }
+            if (this.lastPublishedActivationTipKeys.get(payoutMode)?.tipKey === tipKey) {
+                this.lastPublishedActivationTipKeys.delete(payoutMode);
+            }
+        }
+    }
+
+    private async publishSoloUrgentWork(
+        authoritativeTemplate: IBlockTemplate,
+        trace: BlockNotificationTrace,
+        lane: 'urgent' | 'fallback',
+    ): Promise<BridgePublishResult> {
+        const activation = await this.publishPrestageActivation(
+            authoritativeTemplate,
+            trace,
+            'solo',
+            lane,
+        );
+        if (activation === 'published') {
+            if (this.isSv1CompatibilityBridgeEnabled()) {
+                void this.publishSoloSubsidyBridge(authoritativeTemplate, trace, lane);
+            }
+            return 'published';
+        }
+        return this.publishSoloSubsidyBridge(authoritativeTemplate, trace, lane);
+    }
+
+    private async publishPplnsUrgentWork(
+        authoritativeTemplate: IBlockTemplate,
+        trace: BlockNotificationTrace,
+        lane: 'urgent' | 'fallback',
+    ): Promise<BridgePublishResult> {
+        const activation = await this.publishPrestageActivation(
+            authoritativeTemplate,
+            trace,
+            'pplns',
+            lane,
+        );
+        if (activation === 'published') {
+            if (this.isSv1CompatibilityBridgeEnabled()) {
+                void this.publishPplnsSubsidyBridge(authoritativeTemplate, trace, lane);
+            }
+            return 'published';
+        }
+        return this.publishPplnsSubsidyBridge(authoritativeTemplate, trace, lane);
+    }
+
+    private async publishPrestageActivation(
+        authoritativeTemplate: IBlockTemplate,
+        trace: BlockNotificationTrace,
+        payoutMode: 'solo' | 'pplns',
+        lane: 'urgent' | 'fallback',
+    ): Promise<BridgePublishResult> {
+        if (!this.isSv1CompactActivationEnabled()
+            || !this.isSv1SubsidyBridgeEnabled()
+            || !this.getSv1SubsidyBridgePayoutModes().has(payoutMode)
+            || typeof this.redisMessagingService.publishSv1PrestageActivation !== 'function') {
+            return 'skipped';
+        }
+
+        let subsidySats: number;
+        try {
+            subsidySats = this.validateSubsidyAgainstAuthoritativeTemplate(
+                authoritativeTemplate,
+            );
+        } catch (error) {
+            console.error(`Skipping ${payoutMode} SV1 prestage activation: ${error.message}`);
+            return 'failed';
+        }
+        let payoutSnapshotId: string | undefined;
+        if (payoutMode === 'pplns') {
+            const seed = this.getFreshPplnsSubsidyBridgeSeed(authoritativeTemplate.height);
+            if (seed == null
+                || seed.subsidySats !== subsidySats
+                || seed.basisBits.toLowerCase() !== authoritativeTemplate.bits.toLowerCase()) {
+                return 'skipped';
+            }
+            payoutSnapshotId = seed.payoutSnapshotId;
         }
 
         const tipKey = `${authoritativeTemplate.height}:${authoritativeTemplate.previousblockhash}`;
-        if (this.lastPublishedBridgeTipKeys.get('solo') === tipKey) {
-            return false;
+        if (this.lastPublishedActivationTipKeys.get(payoutMode)?.tipKey === tipKey) {
+            return 'skipped';
+        }
+        const reservation: BridgePublishReservation = {
+            tipKey,
+            attemptId: ++this.bridgePublishAttemptId,
+        };
+        this.lastPublishedActivationTipKeys.set(payoutMode, reservation);
+
+        try {
+            const publishedAtMs = Date.now();
+            const activation: Sv1PrestageActivation = {
+                schemaVersion: 1,
+                type: 'prestage-activation',
+                eventId: `${trace.eventId}:activate:${payoutMode}`,
+                height: authoritativeTemplate.height,
+                previousBlockHash: authoritativeTemplate.previousblockhash.toLowerCase(),
+                version: authoritativeTemplate.version,
+                bits: authoritativeTemplate.bits.toLowerCase(),
+                minTime: authoritativeTemplate.mintime,
+                currentTime: authoritativeTemplate.curtime,
+                subsidySats,
+                payoutMode,
+                ...(payoutSnapshotId == null ? {} : { payoutSnapshotId }),
+                requiredVersionBits: authoritativeTemplate.vbrequired >>> 0,
+                sourceNotificationReceivedAtMs: trace.sourceNotificationReceivedAtMs,
+                publishedAtMs,
+            };
+            const delivered = lane === 'urgent'
+                ? await this.redisMessagingService.publishSv1PrestageActivation(activation)
+                : await this.redisMessagingService.publishSv1PrestageActivation(
+                    activation,
+                    'fallback',
+                );
+            if (!delivered) {
+                throw new Error(`Redis ${lane} prestage activation publisher is unavailable`);
+            }
+            this.markTrace(trace, `sv1_${payoutMode}_activation_workers_notified`);
+            return 'published';
+        } catch (error) {
+            if (this.lastPublishedActivationTipKeys.get(payoutMode) === reservation) {
+                this.lastPublishedActivationTipKeys.delete(payoutMode);
+            }
+            console.error(`Skipping ${payoutMode} SV1 prestage activation: ${error.message}`);
+            return 'failed';
+        }
+    }
+
+    private async publishSoloSubsidyBridge(
+        authoritativeTemplate: IBlockTemplate,
+        trace: BlockNotificationTrace,
+        lane: 'urgent' | 'fallback' = 'urgent',
+    ): Promise<BridgePublishResult> {
+        if (!this.isSv1SubsidyBridgeEnabled()
+            || !this.getSv1SubsidyBridgePayoutModes().has('solo')) {
+            return 'skipped';
+        }
+
+        const tipKey = `${authoritativeTemplate.height}:${authoritativeTemplate.previousblockhash}`;
+        if (this.lastPublishedBridgeTipKeys.get('solo')?.tipKey === tipKey) {
+            return 'skipped';
         }
 
         // Reserve the tip before the Redis await so duplicate ZMQ/longpoll
         // callbacks cannot launch a second in-flight bridge publication.
-        this.lastPublishedBridgeTipKeys.set('solo', tipKey);
+        const reservation: BridgePublishReservation = {
+            tipKey,
+            attemptId: ++this.bridgePublishAttemptId,
+        };
+        this.lastPublishedBridgeTipKeys.set('solo', reservation);
 
         try {
+            this.validateSubsidyAgainstAuthoritativeTemplate(authoritativeTemplate);
             const bridgeTemplate = createSubsidyOnlyBlockTemplate({
                 authoritativeTemplate,
                 network: this.getNetworkName(),
                 payoutMode: 'solo',
                 halvingInterval: this.getOptionalPositiveIntegerEnv('SUBSIDY_HALVING_INTERVAL'),
             });
-            this.validateSubsidyAgainstAuthoritativeTemplate(
-                authoritativeTemplate,
-                bridgeTemplate.coinbasevalue,
-            );
-
             bridgeTemplate.mintime = Math.max(
                 authoritativeTemplate.mintime,
                 authoritativeTemplate.curtime,
@@ -890,51 +1255,62 @@ export class BitcoinRpcService implements OnModuleInit {
             );
             bridgeTemplate.notificationEventId = `${trace.eventId}:bridge`;
             bridgeTemplate.sourceNotificationReceivedAtMs = trace.sourceNotificationReceivedAtMs;
+            bridgeTemplate.notificationPreparedAtMs = Date.now();
+            const publishedAtMs = Date.now();
+            bridgeTemplate.notificationPublishedAtMs = publishedAtMs;
             const update: Sv1BridgeUpdate = {
                 schemaVersion: 1,
                 type: 'subsidy-bridge',
                 eventId: `${trace.eventId}:bridge`,
                 template: bridgeTemplate,
-                publishedAtMs: Date.now(),
+                publishedAtMs,
             };
-            await this.redisMessagingService.publishSv1BridgeUpdate(update);
+            const delivered = lane === 'urgent'
+                ? await this.redisMessagingService.publishSv1BridgeUpdate(update)
+                : await this.redisMessagingService.publishSv1BridgeUpdate(update, 'fallback');
+            if (!delivered) {
+                throw new Error(`Redis ${lane} bridge publisher is unavailable`);
+            }
             this.markTrace(trace, 'sv1_bridge_workers_notified');
-            return true;
+            return 'published';
         } catch (error) {
-            if (this.lastPublishedBridgeTipKeys.get('solo') === tipKey) {
+            if (this.lastPublishedBridgeTipKeys.get('solo') === reservation) {
                 this.lastPublishedBridgeTipKeys.delete('solo');
             }
             console.error(`Skipping SV1 subsidy bridge: ${error.message}`);
-            return false;
+            return 'failed';
         }
     }
 
     private async publishPplnsSubsidyBridge(
         authoritativeTemplate: IBlockTemplate,
         trace: BlockNotificationTrace,
-    ): Promise<boolean> {
+        lane: 'urgent' | 'fallback' = 'urgent',
+    ): Promise<BridgePublishResult> {
         if (!this.isSv1SubsidyBridgeEnabled()
             || !this.getSv1SubsidyBridgePayoutModes().has('pplns')) {
-            return false;
+            return 'skipped';
         }
 
         const tipKey = `${authoritativeTemplate.height}:${authoritativeTemplate.previousblockhash}`;
-        if (this.lastPublishedBridgeTipKeys.get('pplns') === tipKey) {
-            return false;
+        if (this.lastPublishedBridgeTipKeys.get('pplns')?.tipKey === tipKey) {
+            return 'skipped';
         }
 
         const seed = this.getFreshPplnsSubsidyBridgeSeed(authoritativeTemplate.height);
         if (seed == null) {
-            return false;
+            return 'skipped';
         }
 
-        this.lastPublishedBridgeTipKeys.set('pplns', tipKey);
+        const reservation: BridgePublishReservation = {
+            tipKey,
+            attemptId: ++this.bridgePublishAttemptId,
+        };
+        this.lastPublishedBridgeTipKeys.set('pplns', reservation);
 
         try {
-            const expectedSubsidy = calculateBlockSubsidySats(
-                authoritativeTemplate.height,
-                this.getNetworkName(),
-                this.getOptionalPositiveIntegerEnv('SUBSIDY_HALVING_INTERVAL'),
+            const expectedSubsidy = this.validateSubsidyAgainstAuthoritativeTemplate(
+                authoritativeTemplate,
             );
             if (seed.subsidySats !== expectedSubsidy) {
                 throw new Error(
@@ -946,11 +1322,6 @@ export class BitcoinRpcService implements OnModuleInit {
                     `PPLNS bridge seed bits ${seed.basisBits} do not match authoritative bits ${authoritativeTemplate.bits}`,
                 );
             }
-            this.validateSubsidyAgainstAuthoritativeTemplate(
-                authoritativeTemplate,
-                expectedSubsidy,
-            );
-
             const bridgeTemplate = createSubsidyOnlyBlockTemplate({
                 authoritativeTemplate,
                 network: this.getNetworkName(),
@@ -969,22 +1340,117 @@ export class BitcoinRpcService implements OnModuleInit {
             bridgeTemplate.notificationEventId = `${trace.eventId}:bridge:pplns`;
             bridgeTemplate.sourceNotificationReceivedAtMs = trace.sourceNotificationReceivedAtMs;
             bridgeTemplate.payoutBridgeSeedCreatedAtMs = seed.preparedAtMs;
+            bridgeTemplate.notificationPreparedAtMs = Date.now();
+            const publishedAtMs = Date.now();
+            bridgeTemplate.notificationPublishedAtMs = publishedAtMs;
             const update: Sv1BridgeUpdate = {
                 schemaVersion: 1,
                 type: 'subsidy-bridge',
                 eventId: `${trace.eventId}:bridge:pplns`,
                 template: bridgeTemplate,
-                publishedAtMs: Date.now(),
+                publishedAtMs,
             };
-            await this.redisMessagingService.publishSv1BridgeUpdate(update);
+            const delivered = lane === 'urgent'
+                ? await this.redisMessagingService.publishSv1BridgeUpdate(update)
+                : await this.redisMessagingService.publishSv1BridgeUpdate(update, 'fallback');
+            if (!delivered) {
+                throw new Error(`Redis ${lane} bridge publisher is unavailable`);
+            }
             this.markTrace(trace, 'sv1_pplns_bridge_workers_notified');
-            return true;
+            return 'published';
         } catch (error) {
-            if (this.lastPublishedBridgeTipKeys.get('pplns') === tipKey) {
+            if (this.lastPublishedBridgeTipKeys.get('pplns') === reservation) {
                 this.lastPublishedBridgeTipKeys.delete('pplns');
             }
             console.error(`Skipping PPLNS SV1 subsidy bridge: ${error.message}`);
+            return 'failed';
+        }
+    }
+
+    private async publishNextHeightPrestage(
+        authoritativeTemplate: IBlockTemplate,
+        payoutMode: 'solo' | 'pplns',
+        seed?: PplnsSubsidyBridgeSeed,
+    ): Promise<boolean> {
+        if (!this.isSv1SubsidyBridgeEnabled()
+            || !this.getSv1SubsidyBridgePayoutModes().has(payoutMode)) {
             return false;
+        }
+
+        const candidateHeight = authoritativeTemplate.height + 1;
+        const subsidySats = calculateBlockSubsidySats(
+            candidateHeight,
+            this.getNetworkName(),
+            this.getOptionalPositiveIntegerEnv('SUBSIDY_HALVING_INTERVAL'),
+        );
+        if (payoutMode === 'pplns') {
+            if (seed == null
+                || seed.candidateHeight !== candidateHeight
+                || seed.subsidySats !== subsidySats
+                || seed.basisBits.toLowerCase() !== authoritativeTemplate.bits.toLowerCase()) {
+                return false;
+            }
+        }
+
+        const prestageKey = [
+            candidateHeight,
+            payoutMode,
+            subsidySats,
+            authoritativeTemplate.bits.toLowerCase(),
+            seed?.payoutSnapshotId ?? '',
+        ].join(':');
+        if (this.lastPublishedPrestageKeys.get(payoutMode) === prestageKey) {
+            return false;
+        }
+        this.lastPublishedPrestageKeys.set(payoutMode, prestageKey);
+
+        try {
+            const futureShape: IBlockTemplate = {
+                ...authoritativeTemplate,
+                height: candidateHeight,
+                previousblockhash: '0'.repeat(64),
+                transactions: [],
+                coinbasevalue: subsidySats,
+                longpollid: `prestage:${candidateHeight}:${authoritativeTemplate.bits}`,
+                curtime: Math.max(
+                    authoritativeTemplate.curtime,
+                    Math.floor(Date.now() / 1000),
+                ),
+                mintime: Math.max(
+                    authoritativeTemplate.mintime,
+                    authoritativeTemplate.curtime,
+                ),
+            };
+            const template = createSubsidyOnlyBlockTemplate({
+                authoritativeTemplate: futureShape,
+                network: this.getNetworkName(),
+                payoutMode,
+                halvingInterval: this.getOptionalPositiveIntegerEnv('SUBSIDY_HALVING_INTERVAL'),
+                ...(payoutMode === 'pplns'
+                    ? {
+                        payoutSnapshot: {
+                            id: seed!.payoutSnapshotId,
+                            payoutOutputs: seed!.payoutOutputs,
+                        },
+                    }
+                    : {}),
+            });
+            template.notificationEventId = `prestage:${payoutMode}:${candidateHeight}:${Date.now()}`;
+            template.notificationPreparedAtMs = Date.now();
+            const update: Sv1PrestageUpdate = {
+                schemaVersion: 1,
+                type: 'subsidy-prestage',
+                eventId: template.notificationEventId,
+                template,
+                preparedAtMs: template.notificationPreparedAtMs,
+            };
+            await this.redisMessagingService.publishSv1PrestageUpdate(update);
+            return true;
+        } catch (error) {
+            if (this.lastPublishedPrestageKeys.get(payoutMode) === prestageKey) {
+                this.lastPublishedPrestageKeys.delete(payoutMode);
+            }
+            throw error;
         }
     }
 
@@ -1062,6 +1528,12 @@ export class BitcoinRpcService implements OnModuleInit {
                     payoutOutputs,
                     preparedAtMs: Date.now(),
                 });
+                const seed = this.pplnsSubsidyBridgeSeeds.get(candidateHeight);
+                if (seed != null) {
+                    void this.publishNextHeightPrestage(template, 'pplns', seed).catch(error => {
+                        console.error(`Unable to publish next-height PPLNS prestage: ${error.message}`);
+                    });
+                }
             } catch (error) {
                 if (generation === this.pplnsSeedPrecomputeGeneration) {
                     this.pplnsSubsidyBridgeSeeds.delete(candidateHeight);
@@ -1130,19 +1602,32 @@ export class BitcoinRpcService implements OnModuleInit {
 
     private validateSubsidyAgainstAuthoritativeTemplate(
         authoritativeTemplate: IBlockTemplate,
-        subsidySats: number,
-    ): void {
+    ): number {
+        const subsidySats = calculateBlockSubsidySats(
+            authoritativeTemplate.height,
+            this.getNetworkName(),
+            this.getOptionalPositiveIntegerEnv('SUBSIDY_HALVING_INTERVAL'),
+        );
+        if (this.subsidyValidatedTemplates.has(authoritativeTemplate)) {
+            return subsidySats;
+        }
         const totalFees = authoritativeTemplate.transactions.reduce((sum, transaction) => {
             if (!Number.isSafeInteger(transaction.fee) || transaction.fee < 0) {
                 throw new Error('GBT transaction fee is missing or invalid');
             }
-            return sum + transaction.fee;
+            const next = sum + transaction.fee;
+            if (!Number.isSafeInteger(next)) {
+                throw new Error('GBT transaction fee total exceeds safe integer range');
+            }
+            return next;
         }, 0);
         if (subsidySats + totalFees !== authoritativeTemplate.coinbasevalue) {
             throw new Error(
                 `GBT coinbase value ${authoritativeTemplate.coinbasevalue} does not equal subsidy ${subsidySats} plus fees ${totalFees}`,
             );
         }
+        this.subsidyValidatedTemplates.add(authoritativeTemplate);
+        return subsidySats;
     }
 
     private async handleSv1BridgeUpdate(update: Sv1BridgeUpdate): Promise<void> {
@@ -1153,6 +1638,8 @@ export class BitcoinRpcService implements OnModuleInit {
         const template = {
             ...update.template,
             notificationPublishedAtMs: update.publishedAtMs,
+            notificationWorkerReceivedAtMs: update.workerReceivedAtMs,
+            notificationWorkerHandledAtMs: Date.now(),
         };
         const payoutMode = template.payoutMode === 'pplns' ? 'pplns' : 'solo';
         if (this.miningInfo?.blocks != null
@@ -1178,6 +1665,65 @@ export class BitcoinRpcService implements OnModuleInit {
         }
         this.latestBridgeTemplates.set(payoutMode, template);
         this._newSv1BridgeTemplate$.next(template);
+    }
+
+    private handleSv1PrestageActivation(activation: Sv1PrestageActivation): void {
+        if (this.processedTemplateEvents.has(activation.eventId)) {
+            return;
+        }
+        this.rememberProcessedTemplateEvent(activation.eventId);
+        if (this.miningInfo?.blocks != null
+            && activation.height < this.miningInfo.blocks + 1) {
+            return;
+        }
+        if (this.isActivationSupersededByCanonical(activation)) {
+            return;
+        }
+        this._newSv1PrestageActivation$.next({
+            ...activation,
+            workerReceivedAtMs: activation.workerReceivedAtMs ?? Date.now(),
+        });
+    }
+
+    private isActivationSupersededByCanonical(
+        activation: Sv1PrestageActivation,
+    ): boolean {
+        const canonicalStates = [
+            this.canonicalEmissionStates.get(activation.payoutMode),
+            this.canonicalEmissionStates.get('all'),
+        ].filter((state): state is CanonicalEmissionState => state != null);
+        return canonicalStates.some(canonical => {
+            if (canonical.height > activation.height) {
+                return true;
+            }
+            if (canonical.height < activation.height) {
+                return false;
+            }
+            if (canonical.previousBlockHash === activation.previousBlockHash) {
+                return true;
+            }
+            return canonical.publishedAtMs == null
+                || canonical.publishedAtMs >= activation.publishedAtMs;
+        });
+    }
+
+    private handleSv1PrestageUpdate(update: Sv1PrestageUpdate): void {
+        if (this.processedTemplateEvents.has(update.eventId)) {
+            return;
+        }
+        this.rememberProcessedTemplateEvent(update.eventId);
+        const template = {
+            ...update.template,
+            notificationPreparedAtMs: update.preparedAtMs,
+        };
+        if (template.previousblockhash !== '0'.repeat(64)
+            || template.jobType !== 'empty'
+            || template.transactions.length !== 0
+            || (this.miningInfo?.blocks != null
+                && template.height <= this.miningInfo.blocks + 1)) {
+            return;
+        }
+        this._newSv1PrestageTemplate$.next(template);
     }
 
     private isBridgeSupersededByCanonical(
@@ -1470,7 +2016,16 @@ export class BitcoinRpcService implements OnModuleInit {
         params: unknown[] = [],
         timeoutMs?: number,
     ): Promise<T> {
-        const response = await this.client.post('', {
+        return this.callRpcWithClient(this.client, method, params, timeoutMs);
+    }
+
+    private async callRpcWithClient<T>(
+        client: AxiosInstance,
+        method: string,
+        params: unknown[] = [],
+        timeoutMs?: number,
+    ): Promise<T> {
+        const response = await client.post('', {
             jsonrpc: '1.0',
             id: ++this.rpcRequestId,
             method,
@@ -1492,6 +2047,67 @@ export class BitcoinRpcService implements OnModuleInit {
         return maxTarget / target;
     }
 
+    private configureAuxiliaryTemplateSources(options: {
+        user: string;
+        pass: string;
+        port: number;
+        timeout: number;
+    }): void {
+        const configured = this.configService.get<string>('BITCOIN_RPC_AUX_URLS')
+            ?? process.env.BITCOIN_RPC_AUX_URLS
+            ?? '';
+        const urls = [...new Set(configured
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean))];
+        urls.forEach((url, index) => {
+            this.auxiliaryTemplateSources.push({
+                name: `aux-${index + 1}`,
+                client: axios.create({
+                    baseURL: this.buildRpcUrl(url, options.port),
+                    timeout: options.timeout,
+                    auth: {
+                        username: options.user,
+                        password: options.pass,
+                    },
+                }),
+                latestLongpollId: null,
+                longpollLoopStarted: false,
+            });
+        });
+    }
+
+    private async isAuxiliaryTemplateAuthorizedByPrimary(
+        template: IBlockTemplate,
+        source: TemplateRpcSource,
+    ): Promise<boolean> {
+        try {
+            const primaryBestBlockHash = await this.callRpc<string>('getbestblockhash');
+            if (primaryBestBlockHash === template.previousblockhash) {
+                return true;
+            }
+            console.warn(JSON.stringify({
+                event: 'aux_template_rejected',
+                templateSource: source.name,
+                templateHeight: template.height,
+                previousBlockHash: template.previousblockhash,
+                primaryBestBlockHash,
+                reason: 'primary-tip-mismatch',
+            }));
+            return false;
+        } catch (error) {
+            console.warn(JSON.stringify({
+                event: 'aux_template_rejected',
+                templateSource: source.name,
+                templateHeight: template.height,
+                previousBlockHash: template.previousblockhash,
+                reason: 'primary-verification-failed',
+                error: error.message ?? String(error),
+            }));
+            return false;
+        }
+    }
+
     private buildRpcUrl(url: string, port: number): string {
         const normalizedUrl = /^https?:\/\//i.test(url) ? url : `http://${url}`;
         const rpcUrl = new URL(normalizedUrl);
@@ -1509,6 +2125,7 @@ export class BitcoinRpcService implements OnModuleInit {
     private startTrace(
         reason: TemplateRefreshReason,
         sourceNotificationReceivedAtMs?: number,
+        templateSource = 'primary',
     ): BlockNotificationTrace {
         return {
             eventId: `${reason}:${Date.now()}:${this.rpcRequestId + 1}`,
@@ -1516,6 +2133,7 @@ export class BitcoinRpcService implements OnModuleInit {
             startedWallMs: Date.now(),
             startedMonotonic: process.hrtime.bigint(),
             sourceNotificationReceivedAtMs,
+            templateSource,
             stages: { start: 0 },
         };
     }
@@ -1534,6 +2152,7 @@ export class BitcoinRpcService implements OnModuleInit {
             event: 'block_source_notification',
             eventId: trace.eventId,
             source: trace.reason === 'new_block' ? 'zmq' : 'longpoll',
+            templateSource: trace.templateSource,
             receivedAt: new Date(trace.sourceNotificationReceivedAtMs).toISOString(),
             receivedAtMs: trace.sourceNotificationReceivedAtMs,
             tipHeight: blockTemplate.height - 1,
@@ -1553,6 +2172,7 @@ export class BitcoinRpcService implements OnModuleInit {
             event: 'block_notification_trace',
             eventId: trace.eventId,
             reason: trace.reason,
+            templateSource: trace.templateSource,
             tipHeight: blockTemplate.height - 1,
             templateHeight: blockTemplate.height,
             previousBlockHash: blockTemplate.previousblockhash,
@@ -1602,6 +2222,18 @@ export class BitcoinRpcService implements OnModuleInit {
         return configured?.toLowerCase() !== 'false';
     }
 
+    private isSv1CompactActivationEnabled(): boolean {
+        const configured = this.configService.get<string>('SV1_COMPACT_PRESTAGE_ACTIVATION_ENABLED')
+            ?? process.env.SV1_COMPACT_PRESTAGE_ACTIVATION_ENABLED;
+        return configured?.toLowerCase() !== 'false';
+    }
+
+    private isSv1CompatibilityBridgeEnabled(): boolean {
+        const configured = this.configService.get<string>('SV1_COMPACT_ACTIVATION_COMPATIBILITY_BRIDGE')
+            ?? process.env.SV1_COMPACT_ACTIVATION_COMPATIBILITY_BRIDGE;
+        return configured?.toLowerCase() === 'true';
+    }
+
     private getSv1SubsidyBridgePayoutModes(): ReadonlySet<'solo' | 'pplns'> {
         const configured = this.configService.get<string>('SV1_SUBSIDY_BRIDGE_PAYOUT_MODES')
             ?? process.env.SV1_SUBSIDY_BRIDGE_PAYOUT_MODES
@@ -1625,5 +2257,21 @@ export class BitcoinRpcService implements OnModuleInit {
             return network;
         }
         throw new Error(`Invalid NETWORK configuration: ${network ?? 'unset'}`);
+    }
+
+    private validateConfiguredNetworkAgainstCore(
+        coreChain: IMiningInfo['chain'],
+    ): void {
+        const configuredNetwork = this.getNetworkName();
+        const expectedChain: IMiningInfo['chain'] = configuredNetwork === 'mainnet'
+            ? 'main'
+            : configuredNetwork === 'testnet'
+                ? 'test'
+                : 'regtest';
+        if (coreChain !== expectedChain) {
+            throw new Error(
+                `NETWORK=${configuredNetwork} does not match Bitcoin Core chain=${coreChain ?? 'unset'}`,
+            );
+        }
     }
 }
